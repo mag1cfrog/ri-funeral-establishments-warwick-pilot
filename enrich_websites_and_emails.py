@@ -1,7 +1,9 @@
-import re, logging, urllib.parse, time, os
+import re, logging, urllib.parse, time, os, json
 from typing import Dict, Optional, List
+from urllib.parse import urljoin, urlsplit
 
 from bs4 import BeautifulSoup, Comment
+from bs4.element import Tag
 from email_validator import validate_email, EmailNotValidError
 import tldextract
 import httpx
@@ -21,6 +23,10 @@ def _tobool(v) -> bool:
 
 DNS_CHECK = _tobool(getattr(settings, "EMAIL_DNS_CHECK", os.getenv("EMAIL_DNS_CHECK", "0")))
 
+CONTACT_KEYWORDS = re.compile(
+    r"(contact|about|staff|team|location|locations|directions|visit|find|"
+    r"obituar|resources|faq|polic(y|ies))", re.I
+)
 def _brandish(a: str, b: str) -> bool:
     def clean(s): return re.sub(r"[^a-z]", "", s.lower())
     # drop common industry stopwords
@@ -45,6 +51,82 @@ def _normalize_obfuscated(text: str) -> str:
     t = re.sub(r"\s*@\s*", "@", t)
     t = re.sub(r"\s*\.\s*", ".", t)
     return t
+
+def _same_origin(href: str, origin: str) -> bool:
+    try:
+        hu = urlsplit(href)
+        ou = urlsplit(origin)
+        # relative URLs have no netloc; treat as same-origin
+        return (not hu.netloc) or (hu.scheme == ou.scheme and hu.netloc == ou.netloc)
+    except Exception:
+        return False
+
+def _normalize_path(p: str) -> str:
+    # ensure starts with '/', drop query/frag for our crawl purposes
+    u = urlsplit(p)
+    path = u.path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    # keep optional trailing slash variants to improve hit-rate
+    return path
+def _jsonld_emails(soup: BeautifulSoup) -> list[str]:
+    emails = set()
+
+    def _is_ldjson(val: str | None) -> bool:
+        return bool(val) and "ld+json" in val.lower()
+
+    for sc in soup.find_all("script", attrs={"type": _is_ldjson}):
+        if not isinstance(sc, Tag):
+            continue
+        script_content = sc.string
+        if script_content is None or not script_content.strip():
+            continue
+        try:
+            data = json.loads(script_content)
+        except Exception:
+            continue
+        def walk(obj):
+            if isinstance(obj, dict):
+                # common: {"@type":"Organization", "email":"info@..."}
+                if "email" in obj and isinstance(obj["email"], str):
+                    emails.add(obj["email"].strip())
+                for v in obj.values():
+                    walk(v)
+            elif isinstance(obj, list):
+                for it in obj:
+                    walk(it)
+        walk(data)
+    return list(emails)
+    return list(emails)
+
+def _discover_internal_links(html: str, origin: str, limit: int = 12) -> list[str]:
+    """Find a handful of promising same-origin links to crawl next."""
+    out = []
+    try:
+        soup = BeautifulSoup(html or "", "html.parser")
+    except Exception:
+        return out
+    for a in soup.find_all("a", href=True):
+        if not isinstance(a, Tag):
+            continue  # type guard for static analysis (NavigableString/PageElement)
+        raw_href = a.get("href", "")
+        if isinstance(raw_href, list):
+            raw_href = raw_href[0] if raw_href else ""
+        href = str(raw_href or "")
+        text = (a.get_text(" ", strip=True) or "")
+        if not href:
+            continue
+        # absolutize
+        target = urljoin(origin + "/", href)
+        if not _same_origin(target, origin):
+            continue
+        # quick keyword screen on text OR href
+        if not (CONTACT_KEYWORDS.search(text) or CONTACT_KEYWORDS.search(href)):
+            continue
+        out.append(target)
+        if len(out) >= limit:
+            break
+    return out
 
 # ---- HTTPX client with event hooks for terse request/response logs
 def _mk_client() -> httpx.Client:
@@ -191,23 +273,63 @@ def crawl_for_email(website: str) -> Optional[str]:
     if not website.startswith("http"):
         website = "https://" + website.lstrip("/")
     origin = "{u.scheme}://{u.netloc}".format(u=urllib.parse.urlsplit(website))
-    candidates = ["/", "/contact", "/contact-us", "/about", "/about-us"]
+
+    # broadened seeds (with and without trailing slash)
+    base_candidates = [
+        "/", "/contact", "/contact/", "/contact-us", "/contact-us/",
+        "/about", "/about/", "/about-us", "/about-us/",
+        "/location", "/location/", "/locations", "/locations/",
+        "/staff", "/our-staff", "/our-staff/",
+        "/obituaries", "/obituaries/", "/obituary-listings", "/obituary-listings/",
+        "/resources", "/resources/", "/faq", "/faq/", "/faqs", "/faqs/",
+    ]
+    queue = [origin + _normalize_path(p) for p in base_candidates]
+    seen = set()
+    max_pages = 10   # keep it polite
     found: list[str] = []
-    for path in candidates:
-        if robots_allows(origin, path):
-            html = fetch(origin + path)
-            if html:
-                found += extract_emails_from_html(html, website=origin)
-        time.sleep(0.6)  # polite
-    if not found:
-        log.info(f"[EMAIL] none found for {origin}")
-        return None
-    def generic_first(e: str) -> tuple[int, str]:
-        return (0 if re.match(r"^(info|office|admin|contact|service|support)@", e) else 1, e)
-    found_sorted = sorted(set(found), key=generic_first)
-    if log.level <= logging.DEBUG:
-        log.debug(f"[EMAIL] candidates={found_sorted}")
-    return found_sorted[0]
+
+    while queue and len(seen) < max_pages:
+        url = queue.pop(0)
+        if url in seen:
+            continue
+        seen.add(url)
+
+        if not robots_allows(origin, urlsplit(url).path or "/"):
+            log.debug(f"[CRAWL] robots disallow {url}")
+            continue
+
+        html = fetch(url)
+        log.debug(f"[CRAWL] fetch {url} -> {'ok' if bool(html) else 'none'}")
+        if not html:
+            continue
+
+        # 1) page-level email extraction (visible text + mailto)
+        page_emails = extract_emails_from_html(html, website=origin)
+        # 2) JSON-LD emails
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            soup = None
+        if soup:
+            page_emails += _jsonld_emails(soup)
+
+        if page_emails:
+            if log.level <= logging.DEBUG:
+                log.debug(f"[CRAWL] emails on {url}: {page_emails}")
+            found.extend(page_emails)
+            # return immediately with best candidate
+            def generic_first(e: str) -> tuple[int, str]:
+                return (0 if re.match(r"^(info|office|admin|contact|service|support)@", e) else 1, e)
+            return sorted(set(found), key=generic_first)[0]
+
+        # 3) discover a few more promising in-domain links
+        for nxt in _discover_internal_links(html, origin, limit=6):
+            if nxt not in seen and nxt not in queue and len(seen) + len(queue) < 24:
+                queue.append(nxt)
+        time.sleep(0.5)  # polite
+
+    log.info(f"[EMAIL] none found for {origin}")
+    return None
 
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
