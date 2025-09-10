@@ -32,6 +32,20 @@ def _brandish(a: str, b: str) -> bool:
         cb = cb.replace(w, "")
     return bool(ca) and bool(cb) and (ca in cb or cb in ca)
 
+ZERO_WIDTH = r"[\u200B-\u200D\u2060]"
+
+def _normalize_obfuscated(text: str) -> str:
+    t = re.sub(ZERO_WIDTH, "", text)  # strip zero-width chars
+    t = re.sub(r"(?i)(?<![A-Za-z0-9])(?:\(|\[)?\s*a\s*t\s*(?:\)|\])?(?![A-Za-z0-9])", "@", t)
+    t = re.sub(r"(?i)(?<![A-Za-z0-9])(?:\(|\[)?\s*d\s*o\s*t\s*(?:\)|\])?(?![A-Za-z0-9])", ".", t)
+    # keep these plain-word fallbacks (they're harmless and help odd cases)
+    t = re.sub(r"(?i)(?<![A-Za-z0-9])AT(?![A-Za-z0-9])", "@", t)
+    t = re.sub(r"(?i)(?<![A-Za-z0-9])DOT(?![A-Za-z0-9])", ".", t)
+    # then collapse spaces
+    t = re.sub(r"\s*@\s*", "@", t)
+    t = re.sub(r"\s*\.\s*", ".", t)
+    return t
+
 # ---- HTTPX client with event hooks for terse request/response logs
 def _mk_client() -> httpx.Client:
     def log_req(request: httpx.Request):
@@ -165,13 +179,7 @@ def extract_emails_from_html(html: str, website: str|None = None) -> list[str]:
 
     # 2) visible text, with *targeted* de-obfuscation on the text only
     text = soup.get_text(" ", strip=True)
-    # replace only tokenized at/dot; then extract
-    line = re.sub(r"(?i)(?:\(|\[)?\bat\b(?:\)|\])", "@", text)
-    line = re.sub(r"(?i)(?:\(|\[)?\bdot\b(?:\)|\])", ".", line)
-
-    # collapse spaces to form real addresses
-    line = re.sub(r"\s*@\s*", "@", line)
-    line = re.sub(r"\s*\.\s*", ".", line)
+    line = _normalize_obfuscated(text)
     emails |= {m.group(0).lower() for m in EMAIL_RE.finditer(line)}
 
     # 3) validate + rank
