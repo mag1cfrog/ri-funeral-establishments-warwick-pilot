@@ -1,6 +1,9 @@
 import re, logging, urllib.parse, time
 from typing import Dict, Optional, List
 
+from bs4 import BeautifulSoup, Comment
+from email_validator import validate_email, EmailNotValidError
+import tldextract
 import httpx
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter, before_sleep_log
@@ -29,6 +32,10 @@ def _mk_client() -> httpx.Client:
     )
 
 _client = _mk_client()
+
+def _origin(url: str) -> str:
+    u = urllib.parse.urlsplit(url)
+    return f"{u.scheme}://{u.netloc}" if u.scheme and u.netloc else url
 
 @retry(stop=stop_after_attempt(3),
     wait=wait_exponential_jitter(1, 3),
@@ -87,31 +94,65 @@ def fetch(url: str) -> Optional[str]:
     log.debug(f"[FETCH] skip non-HTML/status: {r.status_code} {url}")
     return None
 
-def extract_emails_from_html(html: str) -> List[str]:
-    # Collect direct matches first
-    emails = set(m.group(0).lower() for m in EMAIL_RE.finditer(html or ""))
+def _same_registrable(a: str, b: str) -> bool:
+    if not a or not b: return False
+    ea, eb = tldextract.extract(a), tldextract.extract(b)
+    da = f"{ea.domain}.{ea.suffix}" if ea.suffix else ea.domain
+    db = f"{eb.domain}.{eb.suffix}" if eb.suffix else eb.domain
+    return bool(da) and bool(db) and da.lower() == db.lower()
 
+def _validate_and_rank(emails: list[str], website: str|None) -> list[str]:
+    host = (urllib.parse.urlsplit(website).hostname or "").lower() if website else ""
+    ranked = []
+    for e in sorted(set(emails)):
+        try:
+            info = validate_email(e, check_deliverability=True)  # MX/A check
+            norm = info.normalized
+            domain = norm.split("@", 1)[1].lower()
+            score = 0
+            if host and _same_registrable(host, domain): score -= 10   # prefer same domain
+            if domain in {"gmail.com","outlook.com","hotmail.com","yahoo.com"}: score += 2
+            ranked.append((score, norm))
+        except EmailNotValidError:
+            log.debug(f"[EMAIL] invalid: {e}")
+    ranked.sort()
+    return [e for _, e in ranked]
+
+def extract_emails_from_html(html: str, website: str|None = None) -> list[str]:
     if not html:
-        return sorted(emails)
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    # strip non-visible / noisy nodes
+    for tag in soup(["script","style","noscript","svg","link","meta","iframe"]):
+        tag.decompose()
+    for c in soup.find_all(string=lambda t: isinstance(t, Comment)):
+        c.extract()
 
-    # Normalize common obfuscations:
-    #  user (at) example (dot) com
-    #  user [at] example [dot] com
-    #  user at example dot com
-    norm = html
+    # 1) mailto: first
+    emails = set()
+    for a in soup.select('a[href^="mailto:"]'):
+        raw_href = a.get("href")
+        if isinstance(raw_href, list):
+            raw_href = raw_href[0] if raw_href else ""
+        href = str(raw_href or "")
+        # Defensive: ensure mailto scheme and robust splitting even if malformed
+        if not href.lower().startswith("mailto:"):
+            continue
+        after_scheme = href.split(":", 1)[1] if ":" in href else href
+        local_part = after_scheme.split("?", 1)[0]
+        addr = urllib.parse.unquote(local_part).strip()
+        if addr:
+            emails.add(addr.lower())
 
-    # Replace bracketed / parenthesized tokens and standalone words
-    norm = re.sub(r"(?i)\s*(\(|\[)?at(\)|])?\s*", "@", norm)
-    norm = re.sub(r"(?i)\s*(\(|\[)?dot(\)|])?\s*", ".", norm)
+    # 2) visible text, with *targeted* de-obfuscation on the text only
+    text = soup.get_text(" ", strip=True)
+    # replace only tokenized at/dot; then extract
+    line = re.sub(r"(?i)(?:\(|\[)?\bat\b(?:\)|\])", "@", text)
+    line = re.sub(r"(?i)(?:\(|\[)?\bdot\b(?:\)|\])", ".", line)
+    emails |= {m.group(0).lower() for m in EMAIL_RE.finditer(line)}
 
-    # Collapse spaces specifically around @ and .
-    norm = re.sub(r"\s*@\s*", "@", norm)
-    norm = re.sub(r"\s*\.\s*", ".", norm)
-
-    # Second pass after normalization
-    emails |= set(m.group(0).lower() for m in EMAIL_RE.finditer(norm))
-
-    return sorted(emails)
+    # 3) validate + rank
+    return _validate_and_rank(list(emails), website)
 
 def crawl_for_email(website: str) -> Optional[str]:
     if not website:
@@ -143,23 +184,32 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         name = str(row["Name"]).strip()
         city = str(row.get("City","")).strip()
         query = f"{name} {city} RI funeral home"
+        origin = ""
+        email = None
         try:
             resp = places_text_search_get_website(query)
             best = pick_best_candidate(resp, city)
-            website = best.get("websiteUri") if best else None  # use for navigation only
-            email = crawl_for_email(website) if website else None
+            website_raw = best.get("websiteUri") if best else None
+            origin = _origin(website_raw) if website_raw else ""
+            email = crawl_for_email(origin) if origin else None
         except Exception as e:
             log.warning(f"[ENRICH] failed for {name!r}: {e}")
-            website, email = None, None
+            origin, email = "", None
 
-        log.info(f"[RESULT] {name} | website={bool(website)} | email={bool(email)}")
+        log.info(f"[RESULT] {name} | website={bool(origin)} | email={bool(email)}")
         rows.append({
             "Business Name": name,
             "Street": str(row.get("License Address Line 1","")).strip(),
             "City": city,
             "State": str(row.get("State","")).strip(),
             "ZIP": str(row.get("Zip","")).strip(),
-            "Website URL": website or "",
+            "Phone": str(row.get("Phone","")).strip(),
+            "Fax": str(row.get("Fax","")).strip(),
+            "Owner / Manager": str(row.get("Owner Manager Name","")).strip(),
+            "Status": str(row.get("Status","")).strip(),
+            "Issue Date": str(row.get("Issue Date","")).strip(),
+            "Expiration Date": str(row.get("Expiration Date","")).strip(),
+            "Website URL": origin or "",
             "General Email": email or "",
             "Source": "RI DOH list + business website"
         })
