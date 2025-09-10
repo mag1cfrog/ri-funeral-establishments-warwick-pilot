@@ -122,7 +122,12 @@ def test_enrich_schema_and_blanks(monkeypatch):
     monkeypatch.setattr(mod, "places_text_search_get_website", lambda q: {"places":[]})
     df = pd.DataFrame([{"Name":"A","License Address Line 1":"X","City":"Warwick","State":"RI","Zip":"02886"}])
     out = mod.enrich(df)
-    assert list(out.columns) == ["Business Name","Street","City","State","ZIP","Website URL","General Email","Source"]
+    expected = [
+    "Business Name","Street","City","State","ZIP",
+    "Phone","Fax","Owner / Manager","Status","Issue Date","Expiration Date",
+    "Website URL","General Email","Source"
+    ]
+    assert list(out.columns) == expected
     assert out.iloc[0]["Website URL"] == ""
     assert out.iloc[0]["General Email"] == ""
 
