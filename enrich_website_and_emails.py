@@ -88,9 +88,29 @@ def fetch(url: str) -> Optional[str]:
     return None
 
 def extract_emails_from_html(html: str) -> List[str]:
+    # Collect direct matches first
     emails = set(m.group(0).lower() for m in EMAIL_RE.finditer(html or ""))
-    html2 = html.replace("[at]", "@").replace("(at)", "@").replace(" at ", "@").replace(" dot ", ".")
-    emails |= set(m.group(0).lower() for m in EMAIL_RE.finditer(html2))
+
+    if not html:
+        return sorted(emails)
+
+    # Normalize common obfuscations:
+    #  user (at) example (dot) com
+    #  user [at] example [dot] com
+    #  user at example dot com
+    norm = html
+
+    # Replace bracketed / parenthesized tokens and standalone words
+    norm = re.sub(r"(?i)\s*(\(|\[)?at(\)|])?\s*", "@", norm)
+    norm = re.sub(r"(?i)\s*(\(|\[)?dot(\)|])?\s*", ".", norm)
+
+    # Collapse spaces specifically around @ and .
+    norm = re.sub(r"\s*@\s*", "@", norm)
+    norm = re.sub(r"\s*\.\s*", ".", norm)
+
+    # Second pass after normalization
+    emails |= set(m.group(0).lower() for m in EMAIL_RE.finditer(norm))
+
     return sorted(emails)
 
 def crawl_for_email(website: str) -> Optional[str]:
