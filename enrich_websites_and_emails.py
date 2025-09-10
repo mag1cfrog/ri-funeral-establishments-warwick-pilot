@@ -1,4 +1,4 @@
-import re, logging, urllib.parse, time
+import re, logging, urllib.parse, time, os
 from typing import Dict, Optional, List
 
 from bs4 import BeautifulSoup, Comment
@@ -15,6 +15,22 @@ PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
 API_KEY = settings.GOOGLE_MAPS_API_KEY
 log = setup_logger("ri.enrich", settings.LOG_LEVEL)
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+
+def _tobool(v) -> bool:
+    return str(v).strip().lower() in {"1","true","yes","y","on"}
+
+DNS_CHECK = _tobool(getattr(settings, "EMAIL_DNS_CHECK", os.getenv("EMAIL_DNS_CHECK", "0")))
+
+def _brandish(a: str, b: str) -> bool:
+    def clean(s): return re.sub(r"[^a-z]", "", s.lower())
+    # drop common industry stopwords
+    drop = ("the","funeral","home","homes","fh","mortuary","memorial","services","service")
+    ca = clean(a)
+    cb = clean(b)
+    for w in drop:
+        ca = ca.replace(w, "")
+        cb = cb.replace(w, "")
+    return bool(ca) and bool(cb) and (ca in cb or cb in ca)
 
 # ---- HTTPX client with event hooks for terse request/response logs
 def _mk_client() -> httpx.Client:
@@ -106,11 +122,14 @@ def _validate_and_rank(emails: list[str], website: str|None) -> list[str]:
     ranked = []
     for e in sorted(set(emails)):
         try:
-            info = validate_email(e, check_deliverability=True)  # MX/A check
+            info = validate_email(e, check_deliverability=DNS_CHECK)  # MX/A check
             norm = info.normalized
             domain = norm.split("@", 1)[1].lower()
             score = 0
-            if host and _same_registrable(host, domain): score -= 10   # prefer same domain
+            if host and _same_registrable(host, domain):
+                score -= 10
+            elif host and _brandish(host, domain):
+                score -= 4
             if domain in {"gmail.com","outlook.com","hotmail.com","yahoo.com"}: score += 2
             ranked.append((score, norm))
         except EmailNotValidError:
@@ -149,6 +168,10 @@ def extract_emails_from_html(html: str, website: str|None = None) -> list[str]:
     # replace only tokenized at/dot; then extract
     line = re.sub(r"(?i)(?:\(|\[)?\bat\b(?:\)|\])", "@", text)
     line = re.sub(r"(?i)(?:\(|\[)?\bdot\b(?:\)|\])", ".", line)
+
+    # collapse spaces to form real addresses
+    line = re.sub(r"\s*@\s*", "@", line)
+    line = re.sub(r"\s*\.\s*", ".", line)
     emails |= {m.group(0).lower() for m in EMAIL_RE.finditer(line)}
 
     # 3) validate + rank
@@ -166,7 +189,7 @@ def crawl_for_email(website: str) -> Optional[str]:
         if robots_allows(origin, path):
             html = fetch(origin + path)
             if html:
-                found += extract_emails_from_html(html)
+                found += extract_emails_from_html(html, website=origin)
         time.sleep(0.6)  # polite
     if not found:
         log.info(f"[EMAIL] none found for {origin}")
