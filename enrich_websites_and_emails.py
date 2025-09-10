@@ -1,6 +1,6 @@
 import re, logging, urllib.parse, time, os, json
 from typing import Dict, Optional, List
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
 
 from bs4 import BeautifulSoup, Comment
 from bs4.element import Tag
@@ -23,10 +23,13 @@ def _tobool(v) -> bool:
 
 DNS_CHECK = _tobool(getattr(settings, "EMAIL_DNS_CHECK", os.getenv("EMAIL_DNS_CHECK", "0")))
 
+_TRACKING_KEYS = {"gclid", "fbclid", "msclkid"}
+
 CONTACT_KEYWORDS = re.compile(
     r"(contact|about|staff|team|location|locations|directions|visit|find|"
     r"obituar|resources|faq|polic(y|ies))", re.I
 )
+
 def _brandish(a: str, b: str) -> bool:
     def clean(s): return re.sub(r"[^a-z]", "", s.lower())
     # drop common industry stopwords
@@ -60,6 +63,38 @@ def _same_origin(href: str, origin: str) -> bool:
         return (not hu.netloc) or (hu.scheme == ou.scheme and hu.netloc == ou.netloc)
     except Exception:
         return False
+
+def _sanitize_url(url: str | None) -> str:
+    if not url:
+        return ""
+    u = urlsplit(url)
+    # drop tracking params (utm_*, gclid, etc.)
+    q = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+         if not (k.lower().startswith("utm_") or k.lower() in _TRACKING_KEYS)]
+    return urlunsplit((u.scheme, u.netloc, u.path or "/", urlencode(q, doseq=True), ""))
+
+def _canonical_from_html(html: str, base_url: str) -> str | None:
+    """Honor <link rel=canonical> if it points to (roughly) same site."""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        # Ensure the callable returns a strict bool to satisfy type checkers
+        link_el = soup.find("link", rel=lambda v: bool(v and "canonical" in v.lower()))
+        href = ""
+        if isinstance(link_el, Tag):
+            raw_href = link_el.get("href")
+            # BeautifulSoup may return a list-like (AttributeValueList) for some attributes
+            if isinstance(raw_href, list):
+                raw_href = raw_href[0] if raw_href else ""
+            href = str(raw_href or "").strip()
+    except Exception:
+        return None
+    if not href:
+        return None
+    abs_href = urljoin(base_url + "/", href)
+    # only accept canonical if it’s on same registrable domain (avoid jumping to unrelated hosts)
+    if _same_registrable(urlsplit(base_url).hostname, urlsplit(abs_href).hostname):
+        return abs_href
+    return None
 
 def _normalize_path(p: str) -> str:
     # ensure starts with '/', drop query/frag for our crawl purposes
@@ -206,8 +241,9 @@ def fetch(url: str) -> Optional[str]:
     log.debug(f"[FETCH] skip non-HTML/status: {r.status_code} {url}")
     return None
 
-def _same_registrable(a: str, b: str) -> bool:
-    if not a or not b: return False
+def _same_registrable(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
     ea, eb = tldextract.extract(a), tldextract.extract(b)
     da = f"{ea.domain}.{ea.suffix}" if ea.suffix else ea.domain
     db = f"{eb.domain}.{eb.suffix}" if eb.suffix else eb.domain
@@ -267,14 +303,20 @@ def extract_emails_from_html(html: str, website: str|None = None) -> list[str]:
     # 3) validate + rank
     return _validate_and_rank(list(emails), website)
 
-def crawl_for_email(website: str) -> Optional[str]:
-    if not website:
+def crawl_for_email(start_url: str) -> Optional[str]:
+    if not start_url:
         return None
-    if not website.startswith("http"):
-        website = "https://" + website.lstrip("/")
-    origin = "{u.scheme}://{u.netloc}".format(u=urllib.parse.urlsplit(website))
+    if not start_url.startswith("http"):
+        start_url = "https://" + start_url.lstrip("/")
 
-    # broadened seeds (with and without trailing slash)
+    u = urlsplit(start_url)
+    origin = f"{u.scheme}://{u.netloc}"
+
+    # seed with the exact page first (KEEP this)
+    queue: list[str] = [start_url]
+    seen: set[str] = set()
+
+    # polite breadth-first crawl with a few common candidates
     base_candidates = [
         "/", "/contact", "/contact/", "/contact-us", "/contact-us/",
         "/about", "/about/", "/about-us", "/about-us/",
@@ -283,10 +325,16 @@ def crawl_for_email(website: str) -> Optional[str]:
         "/obituaries", "/obituaries/", "/obituary-listings", "/obituary-listings/",
         "/resources", "/resources/", "/faq", "/faq/", "/faqs", "/faqs/",
     ]
-    queue = [origin + _normalize_path(p) for p in base_candidates]
-    seen = set()
-    max_pages = 10   # keep it polite
+    # extend (don't overwrite) with same-origin candidates
+    for p in base_candidates:
+        cand = origin + _normalize_path(p)
+        if cand not in queue:
+            queue.append(cand)
+
+    max_pages = 10
     found: list[str] = []
+
+    log.debug(f"[CRAWL] start seed={start_url} origin={origin}")
 
     while queue and len(seen) < max_pages:
         url = queue.pop(0)
@@ -299,36 +347,36 @@ def crawl_for_email(website: str) -> Optional[str]:
             continue
 
         html = fetch(url)
-        log.debug(f"[CRAWL] fetch {url} -> {'ok' if bool(html) else 'none'}")
+        log.debug(f"[CRAWL] visit {len(seen)}/{max_pages}: {url} -> {'ok' if bool(html) else 'none'}")
         if not html:
             continue
 
-        # 1) page-level email extraction (visible text + mailto)
-        page_emails = extract_emails_from_html(html, website=origin)
-        # 2) JSON-LD emails
+        # Page-level emails
+        page_emails = extract_emails_from_html(html, website=start_url)
+
+        # JSON-LD emails
         try:
             soup = BeautifulSoup(html, "html.parser")
-        except Exception:
-            soup = None
-        if soup:
             page_emails += _jsonld_emails(soup)
+        except Exception:
+            pass
 
         if page_emails:
             if log.level <= logging.DEBUG:
                 log.debug(f"[CRAWL] emails on {url}: {page_emails}")
             found.extend(page_emails)
-            # return immediately with best candidate
             def generic_first(e: str) -> tuple[int, str]:
                 return (0 if re.match(r"^(info|office|admin|contact|service|support)@", e) else 1, e)
             return sorted(set(found), key=generic_first)[0]
 
-        # 3) discover a few more promising in-domain links
+        # Discover a few more promising in-domain links
         for nxt in _discover_internal_links(html, origin, limit=6):
             if nxt not in seen and nxt not in queue and len(seen) + len(queue) < 24:
                 queue.append(nxt)
+
         time.sleep(0.5)  # polite
 
-    log.info(f"[EMAIL] none found for {origin}")
+    log.info(f"[EMAIL] none found for start={start_url} (origin={origin})")
     return None
 
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
@@ -343,13 +391,24 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
             resp = places_text_search_get_website(query)
             best = pick_best_candidate(resp, city)
             website_raw = best.get("websiteUri") if best else None
-            origin = _origin(website_raw) if website_raw else ""
-            email = crawl_for_email(origin) if origin else None
+
+            # keep the exact page; sanitize tracking; optionally honor canonical (same registrable)
+            seed = _sanitize_url(website_raw)
+            html0 = fetch(seed) if seed else None
+            canon = _canonical_from_html(html0, seed) if html0 else None
+            start_url = canon or seed
+
+
+            website_url = start_url or ""
+            log.info(f"[WEBURL] raw={website_raw!r} clean={seed!r} canonical={canon!r} used={start_url!r}")
+
+            email = crawl_for_email(start_url) if start_url else None
+            
         except Exception as e:
             log.warning(f"[ENRICH] failed for {name!r}: {e}")
-            origin, email = "", None
+            website_url, email = "", None
 
-        log.info(f"[RESULT] {name} | website={bool(origin)} | email={bool(email)}")
+        log.info(f"[RESULT] {name} | website={bool(website_url)} | email={bool(email)}")
         rows.append({
             "Business Name": name,
             "Street": str(row.get("License Address Line 1","")).strip(),
@@ -362,7 +421,7 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
             "Status": str(row.get("Status","")).strip(),
             "Issue Date": str(row.get("Issue Date","")).strip(),
             "Expiration Date": str(row.get("Expiration Date","")).strip(),
-            "Website URL": origin or "",
+            "Website URL": website_url,
             "General Email": email or "",
             "Source": "RI DOH list + business website"
         })
