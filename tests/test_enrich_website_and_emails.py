@@ -143,3 +143,17 @@ def test_obfuscation_fuzz(user, host, tld):
     for v in variants:
         emails = mod.extract_emails_from_html(v)
         assert base in emails
+
+def test_extract_ignores_scripts_and_styles():
+    from enrich_websites_and_emails import extract_emails_from_html
+    html = """
+    <style>.featuredservices-box.hbutton{}</style>
+    <script>var a = data.responseText;</script>
+    <a href="mailto:info@example.com">email us</a>
+    """
+    assert extract_emails_from_html(html) == ["info@example.com"]
+
+def test_validate_and_rank_prefers_same_domain():
+    from enrich_websites_and_emails import _validate_and_rank
+    out = _validate_and_rank(["contact@foo.com","foo@gmail.com"], "https://foo.com")
+    assert out[0].endswith("@foo.com")
