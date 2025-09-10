@@ -5,12 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "beautifulsoup4>=4.13.5",
     "email-validator>=2.3.0",
     "httpx>=0.28.1",
     "pandas>=2.3.2",
     "playwright>=1.55.0",
     "python-dotenv>=1.1.1",
     "tenacity>=9.1.2",
+    "tldextract>=5.3.0",
 ]
 
 [dependency-groups]
